@@ -6,21 +6,15 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
-import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
-import android.graphics.ImageFormat;
-import android.graphics.Matrix;
-import android.graphics.Rect;
-import android.graphics.YuvImage;
+import android.graphics.Color;
 import android.media.Image;
 import android.os.Bundle;
 import android.util.Log;
+import android.util.Size;
 import android.view.ScaleGestureDetector;
 import android.view.View;
 import android.widget.TextView;
 import android.widget.Toast;
-import android.util.Size;
-import android.graphics.Color;
 
 import androidx.annotation.OptIn;
 import androidx.appcompat.app.AppCompatActivity;
@@ -42,12 +36,8 @@ import com.google.android.material.floatingactionbutton.FloatingActionButton;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.mlkit.vision.common.InputImage;
 import com.google.mlkit.vision.text.TextRecognition;
-import com.google.mlkit.vision.text.TextRecognizer;
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
 
-import java.io.ByteArrayOutputStream;
-import java.nio.ByteBuffer;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
@@ -162,40 +152,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private String analyzeNutrition(String rawText) {
-        String text = rawText.toLowerCase();
-        // Regex robusto para tabelas nutricionais
-        Pattern pattern = Pattern.compile("(açúcar|açúcares)[^\\d]*(\\d+[\\.,]?\\d*)");
-        Matcher matcher = pattern.matcher(text);
-
-        if (matcher.find()) {
-            try {
-                String valueStr = matcher.group(2).replace(",", ".");
-                double sugarGrams = Double.parseDouble(valueStr);
-                double teaspoons = sugarGrams / 4.0;
-
-                String message = String.format("AÇÚCAR DETECTADO: %.1fg\n", sugarGrams);
-                message += String.format("Equivale a: %.1f colheres de chá de açúcar puro.\n", teaspoons);
-
-                message += "\n--- RECOMENDAÇÃO OMS ---";
-                message += "\nIdeal: Máximo 25g (6 colheres) por dia.";
-
-                if (sugarGrams >= 15.0) {
-                    txtResult.setTextColor(Color.parseColor("#FF5252"));
-                    message += "\n\n⚠️ ALERTA: Alto teor de açúcar!";
-                } else {
-                    txtResult.setTextColor(Color.parseColor("#8BC34A"));
-                }
-
-                return message;
-            } catch (Exception e) {
-                return "Erro nos valores.";
-            }
-        }
-        txtResult.setTextColor(Color.parseColor("#E0E0E0"));
-        return "Alinhe a linha de 'Açúcares' no quadro.\n\n" + rawText;
-    }
-
     private void startCamera() {
         ListenableFuture<ProcessCameraProvider> cameraProviderFuture = ProcessCameraProvider.getInstance(this);
         cameraProviderFuture.addListener(() -> {
@@ -219,87 +175,105 @@ public class MainActivity extends AppCompatActivity {
 
     @OptIn(markerClass = ExperimentalGetImage.class)
     private void cropAndRecognizeText(ImageProxy imageProxy) {
-        if (!isScanning || previewView.getWidth() == 0) {
+        if (!isScanning) {
             imageProxy.close();
             return;
         }
 
-        Image imageInput = imageProxy.getImage();
-        if (imageInput == null) { imageProxy.close(); return; }
+        Image mediaImage = imageProxy.getImage();
+        if (mediaImage != null) {
+            try {
+                InputImage image = InputImage.fromMediaImage(mediaImage, imageProxy.getImageInfo().getRotationDegrees());
 
-        try {
-            Bitmap bitmapOriginal = yuvToBitmap(imageInput);
-            Matrix matrix = new Matrix();
-            matrix.postRotate(imageProxy.getImageInfo().getRotationDegrees());
-            Bitmap bitmapRotated = Bitmap.createBitmap(bitmapOriginal, 0, 0, bitmapOriginal.getWidth(), bitmapOriginal.getHeight(), matrix, true);
+                TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+                        .process(image)
+                        .addOnSuccessListener(visionText -> {
 
-            // --- MATEMÁTICA DE MAPEAMENTO VERTICAL (O CORAÇÃO DO PROBLEMA) ---
-            float viewWidth = previewView.getWidth();
-            float viewHeight = previewView.getHeight();
-            float bitmapWidth = bitmapRotated.getWidth();
-            float bitmapHeight = bitmapRotated.getHeight();
+                            android.graphics.Rect sugarBox = null;
+                            
+                            // PASSO 1: Encontrar ONDE a palavra Açúcar está na tela e pegar o "retângulo" dela
+                            Pattern sugarPattern = Pattern.compile("a[cç][uú]car(?:es)?");
 
-            // Calcula a escala baseada no SCALE_TYPE "FILL_CENTER" do PreviewView
-            float scaleX = viewWidth / bitmapWidth;
-            float scaleY = viewHeight / bitmapHeight;
-            float scale = Math.max(scaleX, scaleY);
+                            for (com.google.mlkit.vision.text.Text.TextBlock block : visionText.getTextBlocks()) {
+                                for (com.google.mlkit.vision.text.Text.Line line : block.getLines()) {
+                                    String textoLinha = line.getText().toLowerCase();
 
-            // Calcula o deslocamento (o que sobra da imagem fora da tela)
-            float offsetX = (viewWidth - (bitmapWidth * scale)) / 2f;
-            float offsetY = (viewHeight - (bitmapHeight * scale)) / 2f;
+                                    // Usando Regex no lugar do "contains" para não perder nenhuma variação de acento!
+                                    if (sugarPattern.matcher(textoLinha).find()) {
+                                        sugarBox = line.getBoundingBox();
+                                        break;
+                                    }
+                                }
+                                if (sugarBox != null) break;
+                            }
 
-            // Converte as coordenadas do quadro visual para coordenadas da imagem real
-            int cropLeft = (int) ((focusAreaView.getLeft() - offsetX) / scale);
-            int cropTop = (int) ((focusAreaView.getTop() - offsetY) / scale);
-            int cropWidth = (int) (focusAreaView.getWidth() / scale);
-            int cropHeight = (int) (focusAreaView.getHeight() / scale);
+                            // PASSO 2: Procurar o número que está alinhado horizontalmente na MESMA ALTURA (Eixo Y)
+                            if (sugarBox != null) {
+                                int alvoY = sugarBox.centerY();
+                                String melhorNumero = "";
+                                int menorDistancia = Integer.MAX_VALUE;
 
-            // Garante que o recorte está dentro dos limites da imagem
-            cropLeft = Math.max(0, cropLeft);
-            cropTop = Math.max(0, cropTop);
-            if (cropLeft + cropWidth > bitmapRotated.getWidth()) cropWidth = bitmapRotated.getWidth() - cropLeft;
-            if (cropTop + cropHeight > bitmapRotated.getHeight()) cropHeight = bitmapRotated.getHeight() - cropTop;
+                                for (com.google.mlkit.vision.text.Text.TextBlock block : visionText.getTextBlocks()) {
+                                    for (com.google.mlkit.vision.text.Text.Line line : block.getLines()) {
+                                        android.graphics.Rect numBox = line.getBoundingBox();
+                                        if (numBox != null) {
+                                            Matcher m = Pattern.compile("(\\d+[.,]?\\d*)").matcher(line.getText());
+                                            if (m.find()) {
+                                                int diferencaY = Math.abs(numBox.centerY() - alvoY);
 
-            if (cropWidth <= 0 || cropHeight <= 0) {
+                                                // REGRA: O número precisa estar à direita, e na mesma linha
+                                                if (numBox.left > sugarBox.left && diferencaY < menorDistancia && diferencaY < (sugarBox.height() * 2)) {
+                                                    menorDistancia = diferencaY;
+                                                    melhorNumero = m.group(1);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (!melhorNumero.isEmpty()) {
+                                    txtResult.setText(buildNutritionMessage(melhorNumero));
+                                } else {
+                                    txtResult.setTextColor(Color.parseColor("#E0E0E0"));
+                                    txtResult.setText("Achei a palavra Açúcares, mas o número na frente sumiu. Aproxime mais.");
+                                }
+                            } else {
+                                txtResult.setTextColor(Color.parseColor("#E0E0E0"));
+                                txtResult.setText("Procurando a palavra Açúcares na tabela...");
+                            }
+                        })
+                        .addOnCompleteListener(task -> imageProxy.close());
+            } catch (Exception e) {
                 imageProxy.close();
-                return;
             }
-
-            Bitmap bitmapCropped = Bitmap.createBitmap(bitmapRotated, cropLeft, cropTop, cropWidth, cropHeight);
-
-            TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-                    .process(InputImage.fromBitmap(bitmapCropped, 0))
-                    .addOnSuccessListener(visionText -> {
-                        String texto = visionText.getText().trim();
-                        if (!texto.isEmpty()) {
-                            txtResult.setText(analyzeNutrition(texto));
-                        }
-                    })
-                    .addOnCompleteListener(task -> {
-                        imageProxy.close();
-                        bitmapOriginal.recycle();
-                        bitmapRotated.recycle();
-                        bitmapCropped.recycle();
-                    });
-
-        } catch (Exception e) { imageProxy.close(); }
+        } else {
+            imageProxy.close();
+        }
     }
 
-    private Bitmap yuvToBitmap(Image image) {
-        ByteBuffer yBuffer = image.getPlanes()[0].getBuffer();
-        ByteBuffer uBuffer = image.getPlanes()[1].getBuffer();
-        ByteBuffer vBuffer = image.getPlanes()[2].getBuffer();
-        int ySize = yBuffer.remaining();
-        int uSize = uBuffer.remaining();
-        int vSize = vBuffer.remaining();
-        byte[] nv21 = new byte[ySize + uSize + vSize];
-        yBuffer.get(nv21, 0, ySize);
-        vBuffer.get(nv21, ySize, vSize);
-        uBuffer.get(nv21, ySize + vSize, uSize);
-        YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, image.getWidth(), image.getHeight(), null);
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        yuvImage.compressToJpeg(new Rect(0, 0, yuvImage.getWidth(), yuvImage.getHeight()), 100, out);
-        return BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size());
+    // Método focado em exibir a mensagem, recebendo o número já limpo
+    private String buildNutritionMessage(String valueStr) {
+        try {
+            String cleanValue = valueStr.replace(",", ".");
+            double sugarGrams = Double.parseDouble(cleanValue);
+            double teaspoons = sugarGrams / 4.0;
+
+            String message = String.format("AÇÚCAR DETECTADO: %.1fg\n", sugarGrams);
+            message += String.format("Equivale a: %.1f colheres de chá de açúcar puro.\n", teaspoons);
+
+            message += "\n--- RECOMENDAÇÃO OMS ---";
+            message += "\nIdeal: Máximo 25g (6 colheres) por dia.";
+
+            if (sugarGrams >= 15.0) {
+                txtResult.setTextColor(Color.parseColor("#FF5252"));
+                message += "\n\n⚠️ ALERTA: Alto teor de açúcar!";
+            } else {
+                txtResult.setTextColor(Color.parseColor("#8BC34A"));
+            }
+            return message;
+        } catch (Exception e) {
+            return "Erro nos valores.";
+        }
     }
 
     private boolean allPermissionsGranted() {
@@ -307,5 +281,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
-    protected void onDestroy() { super.onDestroy(); cameraExecutor.shutdown(); }
+    protected void onDestroy() {
+        super.onDestroy();
+        cameraExecutor.shutdown();
+    }
 }
